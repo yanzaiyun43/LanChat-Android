@@ -1,3 +1,26 @@
+import java.math.BigDecimal
+
+def versionProps = new Properties()
+def versionPropsFile = rootProject.file('version.properties')
+if (versionPropsFile.exists()) {
+    versionProps.load(new FileInputStream(versionPropsFile))
+}
+
+task incrementVersion {
+    doLast {
+        def propsFile = file('version.properties')
+        def props = new Properties()
+        props.load(new FileInputStream(propsFile))
+        def code = props['VERSION_CODE'].toInteger() + 1
+        def name = props['VERSION_NAME']
+        def newName = (new BigDecimal(name) + new BigDecimal("0.01")).setScale(2, BigDecimal.ROUND_HALF_UP).toString()
+        props.setProperty('VERSION_CODE', code.toString())
+        props.setProperty('VERSION_NAME', newName)
+        props.store(new FileOutputStream(propsFile), 'Version properties')
+        println "Version incremented: ${name} -> ${newName}, code ${code - 1} -> ${code}"
+    }
+}
+
 plugins {
     id 'com.android.application'
 }
@@ -10,8 +33,8 @@ android {
         applicationId "com.lans.chat"
         minSdk 24
         targetSdk 34
-        versionCode 6
-        versionName "1.5"
+        versionCode versionProps['VERSION_CODE'].toInteger()
+        versionName versionProps['VERSION_NAME']
     }
 
     buildTypes {

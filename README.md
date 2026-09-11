@@ -23,10 +23,14 @@
 
 ## 下载
 
-GitHub Actions 自动构建，每次 push 到 `main` 分支或创建 `v*` 标签时触发：
+GitHub Actions 自动构建，每次 push 到 `main` 分支时自动递增版本号（+0.01），创建 `v*` 标签时发布 Release。
 
 - **CI 构建**：push 到 `main` 后，在 Actions 页面下载 `app-debug` 产物
 - **正式发布**：创建 `v*` 标签后，自动发布 Release 并附带 APK
+
+版本号动态递增规则：
+- `versionCode`: 每次构建 +1
+- `versionName`: 每次构建 +0.01（如 1.5 → 1.51 → 1.52 → ...）
 
 ```bash
 # 创建标签发布

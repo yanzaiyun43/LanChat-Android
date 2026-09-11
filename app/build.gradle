@@ -1,5 +1,9 @@
 import java.math.BigDecimal
 
+plugins {
+    id 'com.android.application'
+}
+
 def versionProps = new Properties()
 def versionPropsFile = rootProject.file('version.properties')
 if (versionPropsFile.exists()) {
@@ -8,7 +12,7 @@ if (versionPropsFile.exists()) {
 
 task incrementVersion {
     doLast {
-        def propsFile = file('version.properties')
+        def propsFile = rootProject.file('version.properties')
         def props = new Properties()
         props.load(new FileInputStream(propsFile))
         def code = props['VERSION_CODE'].toInteger() + 1
@@ -19,10 +23,6 @@ task incrementVersion {
         props.store(new FileOutputStream(propsFile), 'Version properties')
         println "Version incremented: ${name} -> ${newName}, code ${code - 1} -> ${code}"
     }
-}
-
-plugins {
-    id 'com.android.application'
 }
 
 android {

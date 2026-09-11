@@ -1,6 +1,6 @@
 # LanChat-Android
 
-局域网多人聊天 APP (Android) — 支持文本/文件传输，局域网扫描发现服务端，自动连接。
+局域网多人聊天 APP (Android) — 支持文本/文件传输，局域网扫描发现服务端，点击自动连接。
 
 ## 功能
 
@@ -21,11 +21,24 @@
 | 系统 | `0x03` | 系统通知（用户加入/离开） |
 | 昵称 | `0x04` | 昵称注册 |
 
+## 下载
+
+GitHub Actions 自动构建，每次 push 到 `main` 分支或创建 `v*` 标签时触发：
+
+- **CI 构建**：push 到 `main` 后，在 Actions 页面下载 `app-debug` 产物
+- **正式发布**：创建 `v*` 标签后，自动发布 Release 并附带 APK
+
+```bash
+# 创建标签发布
+git tag v1.5
+git push origin v1.5
+```
+
 ## 构建
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-username/LanChat-Android.git
+git clone https://github.com/yanzaiyun43/LanChat-Android.git
 cd LanChat-Android
 
 # 使用 Gradle 构建

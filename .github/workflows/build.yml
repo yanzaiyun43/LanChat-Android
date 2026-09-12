@@ -26,6 +26,7 @@ jobs:
           build-tools: 34.0.0
 
       - name: Increment version
+        if: github.ref == 'refs/heads/main'
         run: ./gradlew incrementVersion --no-daemon
 
       - name: Build Debug APK

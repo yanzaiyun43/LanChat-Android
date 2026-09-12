@@ -99,13 +99,12 @@
         android:background="#F5F5F5"
         android:layout_marginBottom="4dp">
 
-        <TextView
-            android:id="@+id/messageArea"
+        <LinearLayout
+            android:id="@+id/messageContainer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:padding="8dp"
-            android:textSize="14sp"
-            android:fontFamily="monospace" />
+            android:orientation="vertical"
+            android:padding="8dp" />
     </ScrollView>
 
     <LinearLayout

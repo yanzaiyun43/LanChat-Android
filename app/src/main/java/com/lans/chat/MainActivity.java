@@ -1,5 +1,7 @@
 package com.lans.chat;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
@@ -12,6 +14,10 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.widget.Button;
+import android.widget.LinearLayout;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.widget.Toast;
 import android.widget.EditText;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -64,7 +70,7 @@ public class MainActivity extends AppCompatActivity {
     private Button btnScan;
     private Button btnServer;
     private Button btnClient;
-    private TextView messageArea;
+    private LinearLayout messageContainer;
     private ScrollView scrollView;
     private EditText messageField;
     private Button btnSend;
@@ -95,7 +101,7 @@ public class MainActivity extends AppCompatActivity {
         btnScan = findViewById(R.id.btnScan);
         btnServer = findViewById(R.id.btnServer);
         btnClient = findViewById(R.id.btnClient);
-        messageArea = findViewById(R.id.messageArea);
+        messageContainer = findViewById(R.id.messageContainer);
         scrollView = findViewById(R.id.scrollView);
         messageField = findViewById(R.id.messageField);
         btnSend = findViewById(R.id.btnSend);
@@ -573,7 +579,20 @@ public class MainActivity extends AppCompatActivity {
 
     private void appendMessage(String sender, String text) {
         uiHandler.post(() -> {
-            messageArea.append("【" + sender + "】" + text + "\n");
+            View msgView = LayoutInflater.from(MainActivity.this).inflate(R.layout.message_item, messageContainer, false);
+            TextView msgText = msgView.findViewById(R.id.messageText);
+            Button copyBtn = msgView.findViewById(R.id.copyButton);
+            msgText.setText("【" + sender + "】" + text);
+            if (sender.equals("系统")) {
+                copyBtn.setVisibility(View.GONE);
+            } else {
+                copyBtn.setOnClickListener(v -> {
+                    ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    cm.setPrimaryClip(ClipData.newPlainText("msg", text));
+                    Toast.makeText(MainActivity.this, "已复制: " + text, Toast.LENGTH_SHORT).show();
+                });
+            }
+            messageContainer.addView(msgView);
             scrollView.post(() -> scrollView.fullScroll(ScrollView.FOCUS_DOWN));
         });
     }

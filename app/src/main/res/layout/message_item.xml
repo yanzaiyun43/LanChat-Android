@@ -23,5 +23,6 @@
         android:layout_height="wrap_content"
         android:text="复制"
         android:textSize="12sp"
-        android:padding="4dp 8dp" />
+        android:paddingLeft="4dp"
+        android:paddingRight="8dp" />
 </LinearLayout>

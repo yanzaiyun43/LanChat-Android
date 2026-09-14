@@ -7,6 +7,7 @@ import android.app.Service;
 import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.PowerManager;
 
 import androidx.core.app.NotificationCompat;
 
@@ -14,10 +15,16 @@ public class ChatService extends Service {
     public static final String CHANNEL_ID = "chat_service_channel";
     public static final int NOTIFICATION_ID = 1;
 
+    private PowerManager.WakeLock wakeLock;
+
     @Override
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
+        PowerManager pm = getSystemService(PowerManager.class);
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LanChat:ChatKeepAlive");
+        wakeLock.setReferenceCounted(false);
+        wakeLock.acquire();
     }
 
     @Override
@@ -29,6 +36,9 @@ public class ChatService extends Service {
 
     @Override
     public void onDestroy() {
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+        }
         stopForeground(true);
         super.onDestroy();
     }

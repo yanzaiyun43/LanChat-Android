@@ -36,7 +36,10 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InterfaceAddress;
@@ -45,7 +48,9 @@ import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -53,19 +58,31 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import javax.crypto.spec.SecretKeySpec;
+
 public class MainActivity extends AppCompatActivity {
 
     private static final int PORT = 9876;
     private static final int REQUEST_MANAGE_STORAGE = 1001;
 
     private static final byte TYPE_TEXT = 0x01;
-    private static final byte TYPE_FILE = 0x02;
     private static final byte TYPE_SYSTEM = 0x03;
-    private static final byte TYPE_NAME = 0x04;
+    private static final byte TYPE_FILE_START = 0x06;
+    private static final byte TYPE_FILE_CHUNK = 0x07;
+    private static final byte TYPE_FILE_RESUME = 0x08;
+    private static final byte TYPE_FILE_END = 0x09;
+    private static final byte TYPE_PING = 0x0A;
+    private static final byte TYPE_PONG = 0x0B;
+
+    private static final int CHUNK_SIZE = 256 * 1024;
+    private static final long HEARTBEAT_INTERVAL_MS = 30_000L;
+    private static final int SOCKET_TIMEOUT_MS = 90_000;
+    private static final long RESUME_WAIT_MS = 15_000L;
 
     // UI
     private TextView infoText;
     private EditText nameField;
+    private EditText passwordField;
     private EditText ipField;
     private Button btnScan;
     private Button btnServer;
@@ -90,6 +107,16 @@ public class MainActivity extends AppCompatActivity {
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private ActivityResultLauncher<String[]> filePickerLauncher;
 
+    // 心跳
+    private volatile long lastPongTime;
+    private Thread heartbeatThread;
+
+    // 文件断点续传：接收会话与发送方等待的 RESUME 响应
+    private final java.util.concurrent.ConcurrentHashMap<String, FileReceiveSession> receiveSessions = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, Integer> resumeValues = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, CountDownLatch> resumeLatches = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, String> pendingEndNames = new java.util.concurrent.ConcurrentHashMap<>();
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -97,6 +124,7 @@ public class MainActivity extends AppCompatActivity {
 
         infoText = findViewById(R.id.infoText);
         nameField = findViewById(R.id.nameField);
+        passwordField = findViewById(R.id.passwordField);
         ipField = findViewById(R.id.ipField);
         btnScan = findViewById(R.id.btnScan);
         btnServer = findViewById(R.id.btnServer);
@@ -162,6 +190,7 @@ public class MainActivity extends AppCompatActivity {
                 while (serverRunning && !serverSocket.isClosed()) {
                     try {
                         Socket socket = serverSocket.accept();
+                        socket.setSoTimeout(SOCKET_TIMEOUT_MS);
                         DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
                         String clientName;
                         try {
@@ -231,12 +260,14 @@ public class MainActivity extends AppCompatActivity {
                 appendMessage("系统", "正在连接 " + ip + ":" + PORT + " ...");
                 Socket socket = new Socket();
                 socket.connect(new InetSocketAddress(ip, PORT), 5000);
+                socket.setSoTimeout(SOCKET_TIMEOUT_MS);
                 clientSocket = socket;
                 clientIn = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
                 clientOut = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
                 clientOut.writeUTF(name);
                 clientOut.flush();
                 appendMessage("系统", "已连接到服务端 " + ip);
+                startHeartbeat();
                 startClientReceiveLoop();
             } catch (IOException e) {
                 appendMessage("系统", "连接失败: " + e.getMessage());
@@ -252,6 +283,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void disconnectClient() {
         clientConnected = false;
+        stopHeartbeat();
         btnClient.setText("连接客户端");
         try { if (clientIn != null) clientIn.close(); } catch (IOException ignored) {}
         try { if (clientOut != null) clientOut.close(); } catch (IOException ignored) {}
@@ -270,25 +302,16 @@ public class MainActivity extends AppCompatActivity {
                 while (clientConnected && clientSocket != null && !clientSocket.isClosed()) {
                     int type = clientIn.read();
                     if (type == -1) break;
-                    if (type == TYPE_TEXT) {
-                        String sender = clientIn.readUTF();
-                        String text = clientIn.readUTF();
-                        appendMessage(sender, text);
-                    } else if (type == TYPE_FILE) {
-                        String sender = clientIn.readUTF();
-                        String fileName = clientIn.readUTF();
-                        long fileLen = clientIn.readLong();
-                        receiveFile(sender, fileName, fileLen);
-                    } else if (type == TYPE_SYSTEM) {
-                        String text = clientIn.readUTF();
-                        appendMessage("系统", text);
-                    }
+                    handleReceived((byte) type, clientIn, clientOut, null);
                 }
+            } catch (java.net.SocketTimeoutException e) {
+                if (clientConnected) appendMessage("系统", "连接超时（心跳无响应），请检查网络");
             } catch (IOException e) {
                 if (clientConnected) {
                     appendMessage("系统", "连接断开: " + e.getMessage());
                 }
             } finally {
+                stopHeartbeat();
                 runOnUiThread(() -> {
                     clientConnected = false;
                     btnClient.setText("连接客户端");
@@ -297,6 +320,222 @@ public class MainActivity extends AppCompatActivity {
                 });
             }
         }, "ClientReceiveThread").start();
+    }
+
+    // ==================== 接收处理（客户端与服务端共用） ====================
+
+    private void handleReceived(byte type, DataInputStream in, DataOutputStream out, ClientHandler handler) throws IOException {
+        SecretKeySpec key = getKey();
+        switch (type) {
+            case TYPE_TEXT: {
+                String sender = in.readUTF();
+                String text = readEncUtf(in, key);
+                appendMessage(sender, text);
+                if (handler != null) {
+                    for (ClientHandler h : clients) {
+                        if (h != handler) h.sendText(sender, text);
+                    }
+                }
+                break;
+            }
+            case TYPE_SYSTEM: {
+                String text = readEncUtf(in, key);
+                appendMessage("系统", text);
+                break;
+            }
+            case TYPE_PING: {
+                if (out != null) {
+                    synchronized (out) {
+                        out.writeByte(TYPE_PONG);
+                        out.flush();
+                    }
+                }
+                break;
+            }
+            case TYPE_PONG: {
+                lastPongTime = System.currentTimeMillis();
+                break;
+            }
+            case TYPE_FILE_START: {
+                handleFileStart(in, out, handler);
+                break;
+            }
+            case TYPE_FILE_CHUNK: {
+                handleFileChunk(in, out, handler, key);
+                break;
+            }
+            case TYPE_FILE_RESUME: {
+                String fileId = in.readUTF();
+                int completed = in.readInt();
+                if (handler != null) {
+                    handler.onDownstreamResume(fileId, completed);
+                } else {
+                    resumeValues.put(fileId, completed);
+                    CountDownLatch latch = resumeLatches.get(fileId);
+                    if (latch != null) latch.countDown();
+                }
+                break;
+            }
+            case TYPE_FILE_END: {
+                String fileId = in.readUTF();
+                String fileName = pendingEndNames.remove(fileId);
+                if (fileName != null) {
+                    appendMessage("系统", "「" + fileName + "」传输完成");
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    private void handleFileStart(DataInputStream in, DataOutputStream out, ClientHandler handler) throws IOException {
+        String sender = in.readUTF();
+        String fileId = in.readUTF();
+        String fileName = in.readUTF();
+        long fileLen = in.readLong();
+        int chunkSize = in.readInt();
+        int totalChunks = in.readInt();
+
+        File partFile = new File(getCacheDir(), fileId + ".part");
+        File progressFile = new File(getCacheDir(), fileId + ".progress");
+        BitSet received = new BitSet(totalChunks);
+        if (partFile.exists() && progressFile.exists() && partFile.length() == fileLen) {
+            BitSet saved = loadProgress(progressFile);
+            if (saved != null && saved.length() <= totalChunks) {
+                received = saved;
+            }
+        } else {
+            partFile.delete();
+            progressFile.delete();
+        }
+        int completed = received.cardinality();
+
+        RandomAccessFile raf = new RandomAccessFile(partFile, "rw");
+        receiveSessions.put(fileId, new FileReceiveSession(sender, fileName, fileId, fileLen,
+                chunkSize, totalChunks, received, raf, partFile, progressFile));
+
+        if (completed > 0) {
+            appendMessage("系统", "「" + fileName + "」检测到已有进度 " + completed + "/" + totalChunks + "，断点续传");
+        }
+        if (out != null) {
+            synchronized (out) {
+                out.writeByte(TYPE_FILE_RESUME);
+                out.writeUTF(fileId);
+                out.writeInt(completed);
+                out.flush();
+            }
+        }
+
+        if (handler != null) {
+            for (ClientHandler h : clients) {
+                if (h != handler) h.beginRelayAsync(sender, fileId, fileName, fileLen, chunkSize, totalChunks);
+            }
+        }
+    }
+
+    private void handleFileChunk(DataInputStream in, DataOutputStream out, ClientHandler handler, SecretKeySpec key) throws IOException {
+        String fileId = in.readUTF();
+        int index = in.readInt();
+        byte[] enc = readEncBytes(in);
+        FileReceiveSession session = receiveSessions.get(fileId);
+        if (session != null && !session.received.get(index)) {
+            try {
+                byte[] plain = CryptoUtil.decrypt(key, enc);
+                synchronized (session.raf) {
+                    session.raf.seek((long) index * session.chunkSize);
+                    session.raf.write(plain);
+                }
+                session.received.set(index);
+                saveProgress(session.progressFile, session.received);
+            } catch (Exception e) {
+                throw new IOException("分片解密失败，请检查双方加密密码是否一致", e);
+            }
+            int done = session.received.cardinality();
+            int nextReport = Math.max(1, session.totalChunks / 20);
+            if (done % nextReport == 0 || done == session.totalChunks) {
+                appendMessage("系统", "接收进度: " + done + "/" + session.totalChunks);
+            }
+            if (done == session.totalChunks) {
+                finishReceive(session);
+                if (out != null) {
+                    synchronized (out) {
+                        out.writeByte(TYPE_FILE_END);
+                        out.writeUTF(fileId);
+                        out.flush();
+                    }
+                }
+            }
+        }
+        if (handler != null) {
+            for (ClientHandler h : clients) {
+                if (h != handler) h.relayChunk(fileId, index, enc);
+            }
+        }
+    }
+
+    private void finishReceive(FileReceiveSession session) {
+        try {
+            session.raf.close();
+        } catch (IOException ignored) {
+        }
+        File outFile = uniqueTarget(new File(getReceiveDir(), session.fileName));
+        try (FileInputStream fis = new FileInputStream(session.partFile);
+             FileOutputStream fos = new FileOutputStream(outFile)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = fis.read(buf)) != -1) {
+                fos.write(buf, 0, n);
+            }
+        } catch (IOException e) {
+            appendMessage("系统", "文件保存失败: " + e.getMessage());
+            return;
+        }
+        session.partFile.delete();
+        session.progressFile.delete();
+        receiveSessions.remove(session.fileId);
+        String msg = "[文件] " + session.fileName + " (" + formatSize(session.fileLen) + ") 已保存到 " + outFile.getAbsolutePath();
+        appendMessage(session.sender, msg);
+        uiHandler.post(() -> infoText.append("\n" + msg));
+    }
+
+    // ==================== 心跳 ====================
+
+    private void startHeartbeat() {
+        stopHeartbeat();
+        lastPongTime = System.currentTimeMillis();
+        heartbeatThread = new Thread(() -> {
+            while (clientConnected && clientSocket != null && !clientSocket.isClosed()) {
+                try {
+                    Thread.sleep(HEARTBEAT_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (!clientConnected || clientSocket == null || clientSocket.isClosed()) return;
+                if (System.currentTimeMillis() - lastPongTime > 3 * HEARTBEAT_INTERVAL_MS) {
+                    appendMessage("系统", "心跳超时，连接可能不稳定");
+                    lastPongTime = System.currentTimeMillis();
+                    continue;
+                }
+                try {
+                    DataOutputStream out = clientOut;
+                    if (out != null) {
+                        synchronized (out) {
+                            out.writeByte(TYPE_PING);
+                            out.flush();
+                        }
+                    }
+                } catch (IOException ignored) {
+                }
+            }
+        }, "HeartbeatThread");
+        heartbeatThread.start();
+    }
+
+    private void stopHeartbeat() {
+        Thread t = heartbeatThread;
+        heartbeatThread = null;
+        if (t != null) t.interrupt();
     }
 
     // ==================== 发送 ====================
@@ -322,7 +561,7 @@ public class MainActivity extends AppCompatActivity {
                     synchronized (clientOut) {
                         clientOut.writeByte(TYPE_TEXT);
                         clientOut.writeUTF(name);
-                        clientOut.writeUTF(text);
+                        writeEncUtf(clientOut, getKey(), text);
                         clientOut.flush();
                     }
                     appendMessage("我", text);
@@ -366,34 +605,13 @@ public class MainActivity extends AppCompatActivity {
                 appendMessage("我", "[文件] " + fileName + " (" + formatSize(fileLen) + ")");
 
                 if (serverRunning) {
-                    CountDownLatch latch = new CountDownLatch(clients.size());
-                    for (ClientHandler h : clients) {
-                        h.sendFile(name, fileName, fileLen, tempFile, latch);
-                    }
-                    try {
-                        latch.await();
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+                    sendFileAsServer(name, fileName, fileLen, tempFile);
                 } else if (clientConnected) {
-                    synchronized (clientOut) {
-                        clientOut.writeByte(TYPE_FILE);
-                        clientOut.writeUTF(name);
-                        clientOut.writeUTF(fileName);
-                        clientOut.writeLong(fileLen);
-                        try (FileInputStream fis = new FileInputStream(tempFile)) {
-                            byte[] buf = new byte[8192];
-                            int n;
-                            while ((n = fis.read(buf)) != -1) {
-                                clientOut.write(buf, 0, n);
-                            }
-                        }
-                        clientOut.flush();
-                    }
+                    sendFileAsClient(name, fileName, fileLen, tempFile);
                 } else {
                     appendMessage("系统", "未建立连接，无法发送");
                 }
-            } catch (IOException e) {
+            } catch (Exception e) {
                 appendMessage("系统", "文件发送失败: " + e.getMessage());
             } finally {
                 if (tempFile != null) tempFile.delete();
@@ -401,25 +619,108 @@ public class MainActivity extends AppCompatActivity {
         }, "SendFileThread").start();
     }
 
-    // ==================== 接收文件 ====================
+    private void sendFileAsServer(String name, String fileName, long fileLen, File tempFile) throws Exception {
+        String fileId = makeFileId(fileName, fileLen);
+        int totalChunks = (int) ((fileLen + CHUNK_SIZE - 1) / CHUNK_SIZE);
+        SecretKeySpec key = getKey();
+        pendingEndNames.put(fileId, fileName);
+        CountDownLatch latch = new CountDownLatch(clients.size());
+        for (ClientHandler h : clients) {
+            new Thread(() -> {
+                try {
+                    int start = h.beginRelayAndWait(name, fileId, fileName, fileLen, CHUNK_SIZE, totalChunks);
+                    if (start > 0) {
+                        appendMessage("系统", h.name + " 已有 " + start + "/" + totalChunks + " 分片，断点续传");
+                    }
+                    transferChunks(tempFile, fileLen, start, totalChunks, fileId, key,
+                            (index, enc) -> h.relayChunk(fileId, index, enc));
+                } catch (Exception e) {
+                    appendMessage("系统", "发送文件到 " + h.name + " 失败: " + e.getMessage());
+                } finally {
+                    latch.countDown();
+                }
+            }, "SendFile-" + h.name).start();
+        }
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
 
-    private void receiveFile(String sender, String fileName, long fileLen) throws IOException {
-        File dir = getReceiveDir();
-        File outFile = new File(dir, fileName);
-        try (FileOutputStream fos = new FileOutputStream(outFile)) {
-            byte[] buf = new byte[8192];
-            long remaining = fileLen;
-            while (remaining > 0) {
-                int toRead = (int) Math.min(buf.length, remaining);
-                int read = clientIn.read(buf, 0, toRead);
-                if (read == -1) break;
-                fos.write(buf, 0, read);
-                remaining -= read;
+    private void sendFileAsClient(String name, String fileName, long fileLen, File tempFile) throws Exception {
+        DataOutputStream out = clientOut;
+        if (out == null) throw new IOException("未连接");
+        String fileId = makeFileId(fileName, fileLen);
+        int totalChunks = (int) ((fileLen + CHUNK_SIZE - 1) / CHUNK_SIZE);
+        SecretKeySpec key = getKey();
+        pendingEndNames.put(fileId, fileName);
+        synchronized (out) {
+            out.writeByte(TYPE_FILE_START);
+            out.writeUTF(name);
+            out.writeUTF(fileId);
+            out.writeUTF(fileName);
+            out.writeLong(fileLen);
+            out.writeInt(CHUNK_SIZE);
+            out.writeInt(totalChunks);
+            out.flush();
+        }
+        int start = waitResume(fileId);
+        if (start > 0) {
+            appendMessage("系统", "接收方已有 " + start + "/" + totalChunks + " 分片，断点续传中...");
+        }
+        transferChunks(tempFile, fileLen, start, totalChunks, fileId, key,
+                (index, enc) -> {
+                    synchronized (out) {
+                        out.writeByte(TYPE_FILE_CHUNK);
+                        out.writeUTF(fileId);
+                        out.writeInt(index);
+                        writeEncBytes(out, enc);
+                        out.flush();
+                    }
+                });
+    }
+
+    private interface ChunkSender {
+        void send(int index, byte[] enc) throws IOException;
+    }
+
+    private void transferChunks(File tempFile, long fileLen, int startChunk, int totalChunks,
+                                String fileId, SecretKeySpec key, ChunkSender sender) throws Exception {
+        try (FileInputStream fis = new FileInputStream(tempFile)) {
+            long skip = (long) startChunk * CHUNK_SIZE;
+            long skipped = 0;
+            while (skipped < skip) {
+                long s = fis.skip(skip - skipped);
+                if (s <= 0) break;
+                skipped += s;
+            }
+            byte[] plain = new byte[CHUNK_SIZE];
+            int nextReport = Math.max(1, totalChunks / 20);
+            for (int i = startChunk; i < totalChunks; i++) {
+                int n = fis.read(plain);
+                if (n <= 0) break;
+                byte[] enc = CryptoUtil.encrypt(key, java.util.Arrays.copyOf(plain, n));
+                sender.send(i, enc);
+                int done = i + 1;
+                if (done % nextReport == 0 || done == totalChunks) {
+                    appendMessage("系统", "发送进度: " + done + "/" + totalChunks);
+                }
             }
         }
-        String msg = "[文件] " + fileName + " (" + formatSize(fileLen) + ") 已保存到 " + outFile.getAbsolutePath();
-        appendMessage(sender, msg);
-        uiHandler.post(() -> infoText.append("\n" + msg));
+    }
+
+    private int waitResume(String fileId) {
+        CountDownLatch latch = new CountDownLatch(1);
+        resumeLatches.put(fileId, latch);
+        try {
+            latch.await(RESUME_WAIT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        Integer v = resumeValues.remove(fileId);
+        resumeLatches.remove(fileId);
+        return v == null ? 0 : v;
     }
 
     // ==================== 广播 ====================
@@ -439,6 +740,10 @@ public class MainActivity extends AppCompatActivity {
         private DataOutputStream out;
         private volatile boolean running = true;
 
+        private final java.util.concurrent.ConcurrentHashMap<String, Integer> myResumeValues = new java.util.concurrent.ConcurrentHashMap<>();
+        private final java.util.concurrent.ConcurrentHashMap<String, CountDownLatch> myResumeLatches = new java.util.concurrent.ConcurrentHashMap<>();
+        private final java.util.concurrent.ConcurrentHashMap<String, Integer> downstreamStart = new java.util.concurrent.ConcurrentHashMap<>();
+
         ClientHandler(Socket socket, String name, DataInputStream in) throws IOException {
             this.socket = socket;
             this.name = name;
@@ -452,55 +757,12 @@ public class MainActivity extends AppCompatActivity {
                 while (running && !socket.isClosed()) {
                     int type = in.read();
                     if (type == -1) break;
-                    if (type == TYPE_TEXT) {
-                        String sender = in.readUTF();
-                        String text = in.readUTF();
-                        appendMessage(sender, text);
-                        for (ClientHandler h : clients) {
-                            if (h != this) h.sendText(sender, text);
-                        }
-                    } else if (type == TYPE_FILE) {
-                        String sender = in.readUTF();
-                        String fileName = in.readUTF();
-                        long fileLen = in.readLong();
-                        appendMessage(sender, "[文件] " + fileName + " (" + formatSize(fileLen) + ") 正在接收...");
-                        File tempFile = File.createTempFile("recv_", ".tmp", getCacheDir());
-                        try (FileOutputStream fos = new FileOutputStream(tempFile)) {
-                            byte[] buf = new byte[8192];
-                            long remaining = fileLen;
-                            while (remaining > 0) {
-                                int toRead = (int) Math.min(buf.length, remaining);
-                                int read = in.read(buf, 0, toRead);
-                                if (read == -1) break;
-                                fos.write(buf, 0, read);
-                                remaining -= read;
-                            }
-                        }
-                        // Save locally
-                        File outFile = new File(getReceiveDir(), fileName);
-                        try (FileInputStream fis = new FileInputStream(tempFile);
-                             FileOutputStream fos = new FileOutputStream(outFile)) {
-                            byte[] buf = new byte[8192];
-                            int n;
-                            while ((n = fis.read(buf)) != -1) {
-                                fos.write(buf, 0, n);
-                            }
-                        }
-                        appendMessage(sender, "[文件] " + fileName + " (" + formatSize(fileLen) + ") 已保存到 " + outFile.getAbsolutePath());
-                        uiHandler.post(() -> infoText.append("\n[文件] " + fileName + " 已保存到 " + outFile.getAbsolutePath()));
-                        // Broadcast to all other clients
-                        CountDownLatch latch = new CountDownLatch(clients.size() - 1);
-                        for (ClientHandler h : clients) {
-                            if (h != this) h.sendFile(sender, fileName, fileLen, tempFile, latch);
-                        }
-                        try {
-                            latch.await();
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
-                        tempFile.delete();
-                    }
+                    handleReceived((byte) type, in, out, this);
                 }
+            } catch (java.net.SocketTimeoutException e) {
+                running = false;
+                appendMessage("系统", name + " 心跳超时，已断开");
+                broadcastSystem(name + " 心跳超时，已断开");
             } catch (IOException e) {
                 // ignore - handled in finally
             } finally {
@@ -522,7 +784,7 @@ public class MainActivity extends AppCompatActivity {
                     synchronized (out) {
                         out.writeByte(TYPE_TEXT);
                         out.writeUTF(sender);
-                        out.writeUTF(text);
+                        writeEncUtf(out, getKey(), text);
                         out.flush();
                     }
                 } catch (IOException e) {
@@ -531,29 +793,63 @@ public class MainActivity extends AppCompatActivity {
             }, "ForwardText-" + name).start();
         }
 
-        void sendFile(String sender, String fileName, long fileLen, File tempFile, CountDownLatch latch) {
+        void onDownstreamResume(String fileId, int completed) {
+            myResumeValues.put(fileId, completed);
+            CountDownLatch latch = myResumeLatches.remove(fileId);
+            if (latch != null) latch.countDown();
+        }
+
+        int beginRelayAndWait(String sender, String fileId, String fileName, long fileLen,
+                              int chunkSize, int totalChunks) throws IOException {
+            synchronized (out) {
+                out.writeByte(TYPE_FILE_START);
+                out.writeUTF(sender);
+                out.writeUTF(fileId);
+                out.writeUTF(fileName);
+                out.writeLong(fileLen);
+                out.writeInt(chunkSize);
+                out.writeInt(totalChunks);
+                out.flush();
+            }
+            CountDownLatch latch = new CountDownLatch(1);
+            myResumeLatches.put(fileId, latch);
+            try {
+                latch.await(RESUME_WAIT_MS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            Integer v = myResumeValues.remove(fileId);
+            myResumeLatches.remove(fileId);
+            int start = (v == null) ? 0 : v;
+            downstreamStart.put(fileId, start);
+            return start;
+        }
+
+        void beginRelayAsync(String sender, String fileId, String fileName, long fileLen,
+                             int chunkSize, int totalChunks) {
             new Thread(() -> {
                 try {
-                    synchronized (out) {
-                        out.writeByte(TYPE_FILE);
-                        out.writeUTF(sender);
-                        out.writeUTF(fileName);
-                        out.writeLong(fileLen);
-                        try (FileInputStream fis = new FileInputStream(tempFile)) {
-                            byte[] buf = new byte[8192];
-                            int n;
-                            while ((n = fis.read(buf)) != -1) {
-                                out.write(buf, 0, n);
-                            }
-                        }
-                        out.flush();
-                    }
+                    beginRelayAndWait(sender, fileId, fileName, fileLen, chunkSize, totalChunks);
                 } catch (IOException e) {
-                    appendMessage("系统", "发送文件到 " + name + " 失败: " + e.getMessage());
-                } finally {
-                    latch.countDown();
+                    appendMessage("系统", "转发文件信息到 " + name + " 失败: " + e.getMessage());
                 }
-            }, "ForwardFile-" + name).start();
+            }, "RelayStart-" + name).start();
+        }
+
+        void relayChunk(String fileId, int index, byte[] enc) {
+            try {
+                Integer start = downstreamStart.get(fileId);
+                if (start != null && index < start) return;
+                synchronized (out) {
+                    out.writeByte(TYPE_FILE_CHUNK);
+                    out.writeUTF(fileId);
+                    out.writeInt(index);
+                    writeEncBytes(out, enc);
+                    out.flush();
+                }
+            } catch (IOException e) {
+                appendMessage("系统", "转发分片到 " + name + " 失败: " + e.getMessage());
+            }
         }
 
         void sendSystem(String text) {
@@ -806,10 +1102,119 @@ public class MainActivity extends AppCompatActivity {
         return "用户" + (int) (Math.random() * 1000);
     }
 
+    private SecretKeySpec getKey() {
+        return CryptoUtil.deriveKey(passwordField.getText().toString());
+    }
+
+    private static void writeEncBytes(DataOutputStream out, byte[] enc) throws IOException {
+        out.writeInt(enc.length);
+        out.write(enc);
+    }
+
+    private static byte[] readEncBytes(DataInputStream in) throws IOException {
+        int len = in.readInt();
+        if (len < 0 || len > 16 * 1024 * 1024) throw new IOException("密文长度异常");
+        byte[] buf = new byte[len];
+        in.readFully(buf);
+        return buf;
+    }
+
+    private static void writeEncUtf(DataOutputStream out, SecretKeySpec key, String text) throws IOException {
+        try {
+            writeEncBytes(out, CryptoUtil.encrypt(key, text.getBytes("UTF-8")));
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("加密失败", e);
+        }
+    }
+
+    private static String readEncUtf(DataInputStream in, SecretKeySpec key) throws IOException {
+        try {
+            return new String(CryptoUtil.decrypt(key, readEncBytes(in)), "UTF-8");
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("解密失败，请检查双方加密密码是否一致", e);
+        }
+    }
+
+    private static String makeFileId(String fileName, long fileLen) {
+        String raw = fileName + "|" + fileLen;
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            byte[] h = digest.digest(raw.getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : h) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return String.valueOf(raw.hashCode());
+        }
+    }
+
+    private static void saveProgress(File f, BitSet bs) {
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(f))) {
+            oos.writeObject(bs);
+        } catch (IOException ignored) {
+        }
+    }
+
+    private static BitSet loadProgress(File f) {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(f))) {
+            Object o = ois.readObject();
+            return (o instanceof BitSet) ? (BitSet) o : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static File uniqueTarget(File target) {
+        if (!target.exists()) return target;
+        String name = target.getName();
+        int dot = name.lastIndexOf('.');
+        String base = dot > 0 ? name.substring(0, dot) : name;
+        String ext = dot > 0 ? name.substring(dot) : "";
+        File dir = target.getParentFile();
+        for (int i = 1; i < 1000; i++) {
+            File f = new File(dir, base + "(" + i + ")" + ext);
+            if (!f.exists()) return f;
+        }
+        return target;
+    }
+
+    private static class FileReceiveSession {
+        final String sender;
+        final String fileName;
+        final String fileId;
+        final long fileLen;
+        final int chunkSize;
+        final int totalChunks;
+        final BitSet received;
+        final RandomAccessFile raf;
+        final File partFile;
+        final File progressFile;
+
+        FileReceiveSession(String sender, String fileName, String fileId, long fileLen,
+                           int chunkSize, int totalChunks, BitSet received,
+                           RandomAccessFile raf, File partFile, File progressFile) {
+            this.sender = sender;
+            this.fileName = fileName;
+            this.fileId = fileId;
+            this.fileLen = fileLen;
+            this.chunkSize = chunkSize;
+            this.totalChunks = totalChunks;
+            this.received = received;
+            this.raf = raf;
+            this.partFile = partFile;
+            this.progressFile = progressFile;
+        }
+    }
+
     @Override
     protected void onDestroy() {
         serverRunning = false;
         clientConnected = false;
+        stopHeartbeat();
         try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) {}
         for (ClientHandler h : clients) {
             try { h.close(); } catch (IOException ignored) {}

@@ -857,7 +857,7 @@ public class MainActivity extends AppCompatActivity {
             try {
                 synchronized (out) {
                     out.writeByte(TYPE_SYSTEM);
-                    out.writeUTF(text);
+                    writeEncUtf(out, getKey(), text);
                     out.flush();
                 }
             } catch (IOException e) {

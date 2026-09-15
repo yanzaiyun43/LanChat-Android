@@ -1,28 +1,17 @@
-import java.math.BigDecimal
-
 plugins {
     id 'com.android.application'
 }
 
-def versionProps = new Properties()
-def versionPropsFile = rootProject.file('version.properties')
-if (versionPropsFile.exists()) {
-    versionProps.load(new FileInputStream(versionPropsFile))
+// 版本号从 git 推导：发版直接 git tag v2.1 即可，无需改文件、无需 CI 自动 bump
+def gitDescribe = { ->
+    def out = new ByteArrayOutputStream()
+    exec { executable 'git'; args 'describe', '--tags', '--always'; standardOutput out }
+    out.toString().trim().replaceFirst('^v', '')
 }
-
-task incrementVersion {
-    doLast {
-        def propsFile = rootProject.file('version.properties')
-        def props = new Properties()
-        props.load(new FileInputStream(propsFile))
-        def code = props['VERSION_CODE'].toInteger() + 1
-        def name = props['VERSION_NAME']
-        def newName = (new BigDecimal(name) + new BigDecimal("0.01")).setScale(2, BigDecimal.ROUND_HALF_UP).toString()
-        props.setProperty('VERSION_CODE', code.toString())
-        props.setProperty('VERSION_NAME', newName)
-        props.store(new FileOutputStream(propsFile), 'Version properties')
-        println "Version incremented: ${name} -> ${newName}, code ${code - 1} -> ${code}"
-    }
+def gitCommitCount = { ->
+    def out = new ByteArrayOutputStream()
+    exec { executable 'git'; args 'rev-list', '--count', 'HEAD'; standardOutput out }
+    out.toString().trim().toInteger()
 }
 
 android {
@@ -33,8 +22,8 @@ android {
         applicationId "com.lans.chat"
         minSdk 24
         targetSdk 34
-        versionCode versionProps['VERSION_CODE'].toInteger()
-        versionName versionProps['VERSION_NAME']
+        versionCode gitCommitCount() + 100
+        versionName gitDescribe()
     }
 
     // CI 注入 LANCHAT_KEYSTORE_FILE（来自 GitHub Actions secret）时用固定签名；

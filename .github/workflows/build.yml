@@ -27,10 +27,6 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null
 
-      - name: Increment version
-        if: github.ref == 'refs/heads/main'
-        run: ./gradlew incrementVersion --no-daemon
-
       - name: Write signing keystore
         env:
           LANCHAT_KEYSTORE: ${{ secrets.LANCHAT_KEYSTORE }}
@@ -45,15 +41,6 @@ jobs:
           LANCHAT_STORE_PASSWORD: ${{ secrets.LANCHAT_STORE_PASSWORD }}
           LANCHAT_KEY_ALIAS: ${{ secrets.LANCHAT_KEY_ALIAS }}
           LANCHAT_KEY_PASSWORD: ${{ secrets.LANCHAT_KEY_PASSWORD }}
-
-      - name: Commit version bump
-        if: github.ref == 'refs/heads/main'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add version.properties
-          git commit -m "chore: auto-increment version [skip ci]" || true
-          git push
 
       - name: Upload APK (CI)
         if: github.ref == 'refs/heads/main'

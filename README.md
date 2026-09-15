@@ -78,14 +78,17 @@ CI 构建的 APK 用固定的发布签名，保证每次构建签名一致、可
 
 ## CI
 
-- push 到 `main`：自动 +0.01 版本号并产出 debug APK
-- 创建 `v*` 标签：自动构建并发布 Release（附 APK）
+- push 到 `main`：构建 debug APK（Actions 页面可下载产物）
+- 创建 `v*` 标签：自动构建并发布 Release（附签名 APK）
+- 版本号从 git 推导：`versionName` = `git describe --tags`，`versionCode` = 提交数 + 偏移；发版只需 `git tag v2.1 && git push origin v2.1`，无需改任何文件
+- checkout 用 `fetch-depth: 0` 以保证能算出 tag 与提交数
 - 端口 9876，包名 `com.lans.chat`
 
 ## 版本
 
 | 版本 | 说明 |
 |------|------|
+| 2.1 | 版本号改由 git tag 推导，移除 version.properties 与 CI 自动 bump |
 | 2.0 | 全新固定签名密钥（Actions secret，不入库）；CI 签名机制固化；README 重写 |
 
-> v1.x 为历史版本，签名不兼容，不再维护。
+> v1.x 为历史版本（version.properties + 自动 bump 旧机制），签名不兼容，不再维护。

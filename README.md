@@ -1,25 +1,24 @@
 # LanChat-Android
 
-局域网多人聊天 APP (Android) — 支持文本/文件传输（AES 加密、分片断点续传），局域网扫描发现服务端，心跳保活，消息一键复制。
+局域网多人聊天 App（Android）—— 纯 Java 手搓 socket，无第三方网络/加密库。支持文本/文件传输（AES 加密、分片断点续传）、局域网扫描发现服务端、心跳保活、消息一键复制。
 
 ## 功能
 
 - **多人聊天**：服务端广播模式，一个服务端可连接多个客户端
-- **消息加密**：文本/系统消息与文件分片均采用 AES-256-CBC 加密（随机 IV），密码由双方约定（留空用内置默认密码）
-- **文本消息**：实时收发文字消息，每条消息右侧有「复制」按钮一键复制
-- **文件传输**：支持发送本地文件，自动保存到 `/storage/emulated/0/局域网聊天/`
-- **断点续传**：文件分片传输（256KB/片），接收进度持久化，传输中断后重新发送同一文件自动跳过已收分片
-- **心跳保活**：30 秒 PING/PONG 心跳 + 90 秒超时检测 + WakeLock，锁屏后连接不断开
-- **局域网扫描**：点击「扫描」按钮自动发现局域网内开启的服务端，点击即可自动连接
-- **昵称设置**：自定义聊天昊名
+- **消息加密**：文本/系统消息与文件分片均采用 AES-256-CBC（随机 IV），密码由双方约定，留空用内置默认密码
+- **文本消息**：实时收发文字，每条消息右侧「复制」按钮一键复制
+- **文件传输**：发送本地文件，自动保存到 `/storage/emulated/0/局域网聊天/`
+- **断点续传**：文件分片传输（256KB/片），接收进度持久化，中断后重发同一文件自动跳过已收分片
+- **心跳保活**：30 秒 PING/PONG + 90 秒超时检测 + WakeLock，锁屏不断连
+- **局域网扫描**：点击「扫描」自动发现局域网内开启的服务端，点击即自动连接
 - **前台服务保活**：后台前台服务保持连接不断开
-- **IP 置顶**：本机 IP 和端口显示在界面顶部
+- **IP 置顶**：本机 IP 与端口显示在界面顶部
 
 ## 协议
 
 | 类型 | 值 | 说明 |
 |------|-----|------|
-| 文本 | `0x01` | 发送文本消息（内容 AES 加密） |
+| 文本 | `0x01` | 文本消息（内容 AES 加密） |
 | 系统 | `0x03` | 系统通知（内容 AES 加密） |
 | 文件开始 | `0x06` | 文件名、大小、分片大小、总分片数 |
 | 文件分片 | `0x07` | 分片索引 + AES 加密的分片数据 |
@@ -27,63 +26,66 @@
 | 传输完成 | `0x09` | 接收方确认全部收完 |
 | 心跳 | `0x0A`/`0x0B` | PING/PONG 保活，90 秒无响应断开 |
 
+> 连接注册（昵称）走明文 `writeUTF`/`readUTF`；TEXT/SYSTEM/FILE 全部走加密格式。改协议时务必逐字段核对写/读对称性。
+
 ## 下载
 
-GitHub Actions 自动构建，每次 push 到 `main` 分支或创建 `v*` 标签时触发：
-
-- **CI 构建**：push 到 `main` 后，在 Actions 页面下载 `app-debug` 产物
-- **正式发布**：创建 `v*` 标签后，自动发布 Release 并附带 APK
-
-```bash
-# 创建标签发布
-git tag v1.6
-git push origin v1.6
-```
+- **Release APK**：[Releases 页](https://github.com/yanzaiyun43/LanChat-Android/releases)，每个 `v*` 标签自动构建并发布带签名的 APK
+- **CI 产物**：push 到 `main` 后可在 Actions 页面下载 `app-debug` 产物
 
 ## 构建
 
 ```bash
-# 克隆项目
 git clone https://github.com/yanzaiyun43/LanChat-Android.git
 cd LanChat-Android
-
-# 使用 Gradle 构建
 ./gradlew assembleDebug
 ```
+
+本地开发无需任何签名配置——debug 构建自动用默认 debug keystore 签名。
+
+## 签名
+
+CI 构建的 APK 用固定的发布签名，保证每次构建签名一致、可覆盖升级（无需卸载旧版）。
+
+- 签名 keystore 存于 GitHub Actions 加密 secret（`LANCHAT_KEYSTORE` 等），**不入仓库**，密钥不公开
+- `app/build.gradle` 通过环境变量读取签名（CI 注入 secret），本地无该环境变量时回退默认 debug keystore
+- `.github/workflows/build.yml` 在构建前解码 secret 到临时文件并注入环境变量
+
+> v2.0 起启用全新签名密钥，与历史版本（v1.x）签名不兼容，从 v1.x 升级到 v2.0 需卸载重装一次；v2.0 之后版本签名连续，可平滑覆盖升级。
 
 ## 使用
 
 1. 一方点击「开启服务端」
-2. 其他人点击「扫描」，选择发现的服务端即可自动连接
+2. 其他人点击「扫描」，选择发现的服务端自动连接
 3. 输入昵称与加密密码（双方需一致，留空用默认密码），发送文字或点击「选择并发送文件」
-4. 收到消息后点击「复制」按钮即可复制消息内容（系统提示不显示复制按钮）
-5. 文件传输中断后，重新发送同一文件即可从断点继续（接收方自动跳过已收分片）
+4. 收到消息点「复制」即可复制内容（系统提示不显示复制按钮）
+5. 文件传输中断后，重新发送同一文件即可从断点继续
 
 ## 权限
 
 - `INTERNET` / `ACCESS_NETWORK_STATE` — 局域网通信
 - `FOREGROUND_SERVICE` / `FOREGROUND_SERVICE_DATA_SYNC` — 前台服务保活
-- `WAKE_LOCK` — 锁屏后保持 CPU 运行，防止连接断开
-- `MANAGE_EXTERNAL_STORAGE` — 保存文件到公开目录 `/storage/emulated/0/局域网聊天/`
+- `WAKE_LOCK` — 锁屏后保持 CPU 运行，防止断连
+- `MANAGE_EXTERNAL_STORAGE` — 保存文件到公开目录
 
 > Android 11+ 需在「设置 → 应用 → 权限 → 所有文件访问」中手动开启 `com.lans.chat`，否则文件保存到应用私有目录。
 
 ## 技术栈
 
-- Java + Android SDK (minSdk 24, targetSdk 34)
+- Java + Android SDK（minSdk 24，targetSdk 34）
 - Gradle 8.5 + AGP 8.2.0
-- androidx.appcompat:appcompat 1.6.1
-- androidx.activity:activity 1.8.2
+- androidx.appcompat:appcompat 1.6.1 / androidx.activity:activity 1.8.2 / material 1.11.0
 
-## 版本历史
+## CI
+
+- push 到 `main`：自动 +0.01 版本号并产出 debug APK
+- 创建 `v*` 标签：自动构建并发布 Release（附 APK）
+- 端口 9876，包名 `com.lans.chat`
+
+## 版本
 
 | 版本 | 说明 |
 |------|------|
-| 1.0 | 基础 1 对 1 聊天 |
-| 1.1 | 多人聊天、昵称、服务端/客户端切换、IP 置顶、图标替换 |
-| 1.2 | 修复文件 race condition、文件保存到公开目录、前台服务保活 |
-| 1.3 | 修复 Android 14 FGS `dataSync` 崩溃 |
-| 1.4 | 局域网扫描发现服务端、自动跳转权限页面 |
-| 1.5 | 扫描发现的服务端点击自动连接 |
-| 1.6 | 每条消息右侧添加「复制」按钮，一键复制消息内容 |
-| 1.62 | AES 消息加密、心跳保活（PING/PONG + WakeLock）、文件分片断点续传 |
+| 2.0 | 全新固定签名密钥（Actions secret，不入库）；CI 签名机制固化；README 重写 |
+
+> v1.x 为历史版本，签名不兼容，不再维护。

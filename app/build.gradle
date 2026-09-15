@@ -37,21 +37,32 @@ android {
         versionName versionProps['VERSION_NAME']
     }
 
+    // CI 注入 LANCHAT_KEYSTORE_FILE（来自 GitHub Actions secret）时用固定签名；
+    // 本地开发无该环境变量，debug 自动用默认 ~/.android/debug.keystore
+    def fixedKeyFile = System.getenv('LANCHAT_KEYSTORE_FILE')
+    def hasFixedKey = fixedKeyFile != null && rootProject.file(fixedKeyFile).exists()
+
     signingConfigs {
         lanchat {
-            storeFile rootProject.file('keystore/lanchat.jks')
-            storePassword 'lanchat123'
-            keyAlias 'lanchat'
-            keyPassword 'lanchat123'
+            if (hasFixedKey) {
+                storeFile rootProject.file(fixedKeyFile)
+                storePassword System.getenv('LANCHAT_STORE_PASSWORD')
+                keyAlias System.getenv('LANCHAT_KEY_ALIAS')
+                keyPassword System.getenv('LANCHAT_KEY_PASSWORD')
+            }
         }
     }
 
     buildTypes {
         debug {
-            signingConfig signingConfigs.lanchat
+            if (hasFixedKey) {
+                signingConfig signingConfigs.lanchat
+            }
         }
         release {
-            signingConfig signingConfigs.lanchat
+            if (hasFixedKey) {
+                signingConfig signingConfigs.lanchat
+            }
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }

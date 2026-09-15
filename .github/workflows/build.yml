@@ -31,8 +31,20 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: ./gradlew incrementVersion --no-daemon
 
+      - name: Write signing keystore
+        env:
+          LANCHAT_KEYSTORE: ${{ secrets.LANCHAT_KEYSTORE }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ks"
+          printf '%s' "$LANCHAT_KEYSTORE" | base64 -d > "$RUNNER_TEMP/ks/lanchat.jks"
+
       - name: Build Debug APK
         run: ./gradlew assembleDebug --no-daemon
+        env:
+          LANCHAT_KEYSTORE_FILE: ${{ runner.temp }}/ks/lanchat.jks
+          LANCHAT_STORE_PASSWORD: ${{ secrets.LANCHAT_STORE_PASSWORD }}
+          LANCHAT_KEY_ALIAS: ${{ secrets.LANCHAT_KEY_ALIAS }}
+          LANCHAT_KEY_PASSWORD: ${{ secrets.LANCHAT_KEY_PASSWORD }}
 
       - name: Commit version bump
         if: github.ref == 'refs/heads/main'

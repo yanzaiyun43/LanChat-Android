@@ -37,8 +37,21 @@ android {
         versionName versionProps['VERSION_NAME']
     }
 
+    signingConfigs {
+        lanchat {
+            storeFile rootProject.file('keystore/lanchat.jks')
+            storePassword 'lanchat123'
+            keyAlias 'lanchat'
+            keyPassword 'lanchat123'
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig signingConfigs.lanchat
+        }
         release {
+            signingConfig signingConfigs.lanchat
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
